@@ -7,7 +7,7 @@ main = Blueprint("main", __name__)
 
 @main.route("/")
 def home():
-    return jsonify({"message": "Hello, World!!!!!"})
+    return jsonify({"message": "Hello, World!!!"})
 
 @main.route("/data", methods=["POST"])
 def process_data():
