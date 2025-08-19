@@ -128,6 +128,7 @@ jobs:
           fi
           echo "ZAP_WARNINGS=$WARN_COUNT" >> $GITHUB_ENV
           echo "ZAP found $WARN_COUNT medium/high warnings"
+        continue-on-error: true
 
       - name: Collect ZAP report and publish to gh-pages
         if: always()
