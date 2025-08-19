@@ -116,6 +116,7 @@ jobs:
           fail_action: false
           token: ${{ secrets.ZAP_GITHUB_PAT }}
           allow_issue_writing: true
+          artifact_name: zap-scan-report
 
       - name: Count ZAP Warnings
         id: zap_warnings
