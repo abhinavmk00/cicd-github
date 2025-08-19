@@ -1,198 +1,159 @@
-# GitHub Actions workflow for secure CI/CD pipeline
-name: security
+name: Full Security Pipeline
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
-
-permissions:
-  contents: write
-  pages: write
-  id-token: write
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  security_checks:
+  security-tests:
     runs-on: ubuntu-latest
+    permissions: write-all
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # Set up Docker Buildx (required for building and scanning images)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
 
+      # Checkout the code
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # Get values from config.json
+      - name: Parse config.json
+        run: |
+          IMAGE_NAME=$(jq -r '.image_name' config.json)
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+
+      # Verify IMAGE_NAME
+      - name: Verify IMAGE_NAME
+        run: echo "IMAGE_NAME is $IMAGE_NAME"
+
+      # Set up Python for static code analysis
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v3
         with:
-          python-version: 3.11
+          python-version: 3.8
 
-      - name: Secure Secrets Injection
+      # Install dependencies
+      - name: Install Dependencies
         run: |
-          echo "Securely injecting secrets into environment..."
-          echo "SECRET_KEY=${{ secrets.SECRET_KEY }}" > .env
-          echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env
-          echo "FLASK_ENV=production" >> .env
-          # Ensure .env file has proper permissions
-          chmod 600 .env
-          echo "Secrets injected securely (not exposed in logs)"
+          pip install -r requirements.txt
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install bandit pip-audit
-
+      # Static Code Analysis with Bandit
       - name: Static Code Analysis with Bandit
         run: |
-          bandit -r app/ -f json -o bandit-report.json || echo "Bandit scan completed with findings"
-          bandit -r app/ || echo "Bandit found security issues - check the report"
+          pip install bandit
+          bandit -r app/
 
-      - name: Dependency Vulnerability Scan
+      # Dependency Scan with Snyk CLI
+      - name: Dependency Scan with Snyk
         run: |
-          echo "Running pip-audit for dependency vulnerability scanning..."
-          pip-audit --requirement requirements.txt --format=json --output=pip-audit-report.json || echo "pip-audit completed with findings"
-          
-      - name: Dependency Scan with Snyk (Mandatory)
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: |
-          if [ -z "$SNYK_TOKEN" ]; then
-            echo "ERROR: SNYK_TOKEN is required for security compliance"
-            echo "Please add SNYK_TOKEN to repository secrets"
-            exit 1
-          fi
-          echo "Running mandatory Snyk vulnerability scan..."
           docker pull snyk/snyk:python-3.11
-          docker run --rm -e SNYK_TOKEN=${SNYK_TOKEN} -v $(pwd):/project -w /project snyk/snyk:python-3.11 snyk test --file=requirements.txt --severity-threshold=high
+          docker run --rm -e SNYK_TOKEN=${{ secrets.SNYK_TOKEN }} -v $(pwd):/project -w /project snyk/snyk:python-3.11 snyk test --file=requirements.txt --token=$SNYK_TOKEN
 
-      - name: Docker Build
+      # Docker Build and Container Scan with Trivy
+      - name: Docker Build and Container Scan with Trivy
         run: |
-          docker build -t secure-flask-app .
+          set -e  # Exit immediately if any command fails
 
-      - name: Container Scan with Trivy
-        run: |
-          docker pull aquasec/trivy:0.18.3 || true
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.18.3 image secure-flask-app
+          echo "Verifying Docker setup..."
+          docker info
 
+          IMAGE_NAME="flask-app"
+
+          echo "Building the Docker image..."
+          docker build -t library/$IMAGE_NAME .
+
+          echo "Verifying if the image was built successfully..."
+          docker inspect --type=image library/$IMAGE_NAME:latest > /dev/null || { echo "Image build failed"; exit 1; }
+
+          echo "Logging into Docker Hub..."
+          echo ${{ secrets.DOCKER_PASSWORD }} | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+          echo "Running Trivy scan..."
+          docker pull aquasec/trivy:0.57.1
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.57.1 \
+            image library/$IMAGE_NAME
+
+      # Secrets Scanning with Gitleaks
       - name: Secrets Scanning with Gitleaks
         uses: zricethezav/gitleaks-action@v2
         with:
           args: --no-git --path=.
-
-            # Run the container in background for DAST
-      - name: Start container
+                
+      # Run Flask application container
+      - name: Run Flask App
         run: |
-          echo "Starting container for security testing..."
-          docker run -d --name app-under-test -p 5001:5001 \
-            -e FLASK_ENV=production \
-            -e SECRET_KEY=test-key-for-security-testing \
-            -e DATABASE_URL=sqlite:///test.db \
-            secure-flask-app
-          
-          echo "Waiting for container to be ready..."
-          sleep 5
-          
-          # Check container status
-          docker ps -a --filter name=app-under-test
-          docker logs app-under-test
-          
-          # Wait for app to be ready (HTTP 200)
-          for i in {1..30}; do
-            echo "Attempt $i: Checking if app is ready..."
-            status=$(curl -o /dev/null -s -w "%{http_code}\n" http://localhost:5001 || echo "000")
-            echo "HTTP Status: $status"
-            if [ "$status" -eq 200 ]; then
-              echo "App is ready!"
+          docker run -d --name flask-app -p 5001:5001 \
+            -e DATABASE_URL=${{ secrets.DATABASE_URL }} \
+            -e SECRET_KEY=${{ secrets.SECRET_KEY }} \
+            flask-app
+            
+      # Inspect the container status
+      - name: Debug Flask Container
+        run: |
+          docker ps -a
+          docker logs flask-app
+
+      # Wait for Flask App to start
+      - name: Wait for Flask App to Start
+        run: |
+          for i in {1..20}; do
+            if curl -s http://localhost:5001 > /dev/null; then
+              echo "Flask app is up and running."
               break
             fi
-            if [ $i -eq 30 ]; then
-              echo "App failed to start after 30 attempts"
-              docker logs app-under-test
-              exit 1
-            fi
-            sleep 2
+            echo "Waiting for Flask app..."
+            sleep 5
           done
-
-      - name: Run OWASP ZAP Full Scan
+          curl -s http://localhost:5001 || { echo "Flask app failed to start."; exit 1; }
+      
+      # Run OWASP ZAP Scan (DAST)
+      - name: Run OWASP ZAP Scan
         uses: zaproxy/action-full-scan@v0.7.0
         with:
           target: 'http://localhost:5001'
-          fail_action: false
-          token: ${{ secrets.ZAP_GITHUB_PAT }}
-          allow_issue_writing: true
 
-      - name: Count ZAP Warnings
-        id: zap_warnings
+      # Publish ZAP Report to GitHub Pages
+      - name: Publish ZAP Report to GitHub Pages
         run: |
-          WARN_COUNT=0
-          if [ -f report_json.json ]; then
-            WARN_COUNT=$(jq '[.alerts[] | select(.risk == "Medium" or .risk == "High")] | length' report_json.json)
-          fi
-          echo "ZAP_WARNINGS=$WARN_COUNT" >> $GITHUB_ENV
-          echo "ZAP found $WARN_COUNT medium/high warnings"
-
-      - name: Collect ZAP report and publish to gh-pages
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.ZAP_GITHUB_PAT }}
-        run: |
-          # Use safe timestamp for filenames
           REPORT_NAME="zap_report_$(date +'%Y%m%d%H%M%S').html"
-          if [ -f report_html.html ]; then
-            echo "Publishing ZAP security report to GitHub Pages..."
-            mv report_html.html "$REPORT_NAME"
-            git config --global user.name "github-actions"
-            git config --global user.email "actions@github.com"
-            git fetch origin || true
-            git checkout --orphan gh-pages || git checkout gh-pages || git switch --orphan gh-pages
-            git rm -rf . || true
-            cp "$REPORT_NAME" index.html
-            echo "# Security Report" > README.md
-            echo "Latest security scan report: [View Report](./index.html)" >> README.md
-            echo "Generated: $(date)" >> README.md
-            git add index.html README.md
-            git commit -m "Publish ZAP report: $REPORT_NAME (Run ID: $GITHUB_RUN_ID)" || true
-            git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} gh-pages --force || echo "Failed to push to gh-pages"
-            echo "Security report should be available at: https://${{ github.repository_owner }}.github.io/secure-cicd-pipeline"
-          else
-            echo "ZAP report not found"
-          fi
+          mv report_html.html $REPORT_NAME
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          
+          git fetch origin
 
-      - name: Stop container
+          git checkout gh-pages
+          git rebase origin/gh-pages
+          
+          echo "Push new report to gh-pages branch..."
+          cp $REPORT_NAME index.html
+          git add index.html
+          git commit -m "Publish ZAP report: $REPORT_NAME (Run ID: $GITHUB_RUN_ID)"
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} gh-pages
+
+      # Clean up Flask application container
+      - name: Stop and Remove Flask App
         if: always()
         run: |
-          docker stop app-under-test || true
-          docker rm app-under-test || true
+          docker stop flask-app
+          docker rm flask-app
 
-      - name: Login to Docker Hub
-        if: success() && env.ZAP_WARNINGS != '' && [ "$ZAP_WARNINGS" -lt 5 ]
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and Push to Docker Hub
-        if: success() && env.ZAP_WARNINGS != '' && [ "$ZAP_WARNINGS" -lt 5 ]
+      # Secure Secrets Injection
+      - name: Inject Secrets Securely
         run: |
-          echo "All security scans passed (or warnings < 5)! Building and pushing to Docker Hub..."
-          COMMIT_SHA=$(git rev-parse --short HEAD)
-          IMAGE_NAME="${{ secrets.DOCKERHUB_USERNAME }}/secure-flask-app"
-          docker build -t ${IMAGE_NAME}:${COMMIT_SHA} -t ${IMAGE_NAME}:latest .
-          docker push ${IMAGE_NAME}:${COMMIT_SHA}
-          docker push ${IMAGE_NAME}:latest
-          echo "Successfully pushed to Docker Hub:"
-          echo "- ${IMAGE_NAME}:${COMMIT_SHA}"
-          echo "- ${IMAGE_NAME}:latest"
+          echo ${{ secrets.SECRET_KEY }} > .env
+          echo ${{ secrets.DATABASE_URL }} >> .env
 
-      - name: Security Scan Summary
-        if: always()
+      # Push Docker Image to Docker Hub
+      - name: Push Docker Image to Docker Hub
         run: |
-          echo "=== SECURITY SCAN SUMMARY ==="
-          echo "✅ Static Code Analysis (Bandit): Completed"
-          echo "✅ Dependency Vulnerability Scan (pip-audit): Completed"
-          echo "✅ Dependency Scan (Snyk): Completed"
-          echo "✅ Container Security Scan (Trivy): Completed"
-          echo "✅ Secrets Scanning (Gitleaks): Completed"
-          echo "✅ Dynamic Security Testing (OWASP ZAP): Completed"
-          echo "📊 Security Report: https://${{ github.repository_owner }}.github.io/secure-cicd-pipeline"
-          if [ "${{ job.status }}" == "success" ] && [ "$ZAP_WARNINGS" -lt 5 ]; then
-            echo "🚀 Docker Image: Published to Docker Hub"
-          else
-            echo "❌ Docker Image: Not published due to security issues or too many ZAP warnings"
-          fi
+          docker tag $IMAGE_NAME ${{ secrets.DOCKER_USERNAME }}/$IMAGE_NAME:latest
+          docker push ${{ secrets.DOCKER_USERNAME }}/$IMAGE_NAME:latest
